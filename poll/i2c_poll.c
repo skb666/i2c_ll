@@ -8,6 +8,8 @@
 #include "stm32l0xx_ll_gpio.h"
 #include "stm32l0xx_ll_cortex.h"
 
+#define MAX_NBYTE_SIZE (255)
+
 #define I2C_SPEED_FREQ              400000
 #define I2C_BYTE_TIMEOUT_US         ((10^6) / (I2C_SPEED_FREQ / 9) + 1)
 #define I2C_BYTE_TIMEOUT_MS         (I2C_BYTE_TIMEOUT_US / 1000 + 1)
@@ -24,6 +26,7 @@
 #endif
 
 typedef enum {
+    I2C_RESUME,
     I2C_TRANSMITTER,
     I2C_RECEIVER,
     I2C_RECEIVER_RESTART
@@ -96,12 +99,18 @@ void I2Cx_Init(I2C_TypeDef* I2Cx)
 
 
 static bool I2Cx_StartTransmission(I2C_TypeDef* I2Cx, i2c_direction_t Direction,
-    uint8_t SlaveAddr, uint8_t TransferSize)
+    uint8_t SlaveAddr, uint8_t TransferSize, uint8_t resume)
 {
     uint32_t Timeout = I2C_BYTE_TIMEOUT_MS;
+    uint32_t EndMode;
     uint32_t Request;
 
+    EndMode = resume ? LL_I2C_MODE_RELOAD : LL_I2C_MODE_SOFTEND;
+
     switch (Direction) {
+    case I2C_RESUME:
+        Request = LL_I2C_GENERATE_NOSTARTSTOP;
+        break;
     case I2C_TRANSMITTER:
         Request = LL_I2C_GENERATE_START_WRITE;
         break;
@@ -116,7 +125,7 @@ static bool I2Cx_StartTransmission(I2C_TypeDef* I2Cx, i2c_direction_t Direction,
     }
 
     LL_I2C_HandleTransfer(I2Cx, SlaveAddr, LL_I2C_ADDRSLAVE_7BIT,
-        TransferSize, LL_I2C_MODE_SOFTEND, Request);
+        TransferSize, EndMode, Request);
 
     while (!LL_I2C_IsActiveFlag_TXIS(I2Cx) && !LL_I2C_IsActiveFlag_RXNE(I2Cx)) {
         if (LL_I2C_IsActiveFlag_NACK(I2Cx)) {
@@ -139,7 +148,7 @@ static bool I2Cx_SendByte(I2C_TypeDef* I2Cx, uint8_t byte)
     uint32_t Timeout = I2C_BYTE_TIMEOUT_MS;
 
     LL_I2C_TransmitData8(I2Cx, byte);
-    while (!LL_I2C_IsActiveFlag_TXIS(I2Cx) && !LL_I2C_IsActiveFlag_TC(I2Cx)) {
+    while (!LL_I2C_IsActiveFlag_TXIS(I2Cx) && !LL_I2C_IsActiveFlag_TC(I2Cx) && !LL_I2C_IsActiveFlag_TCR(I2Cx)) {
         /* Break if ACK failed */
         if (LL_I2C_IsActiveFlag_NACK(I2Cx)) {
             LL_I2C_ClearFlag_NACK(I2Cx);
@@ -182,18 +191,55 @@ static void I2Cx_StopTransmission(I2C_TypeDef* I2Cx)
     LL_I2C_GenerateStopCondition(I2Cx);
 }
 
+bool I2Cx_IsDeviceReady(I2C_TypeDef* I2Cx, uint8_t SlaveAddr)
+{
+    uint32_t Timeout = I2C_BYTE_TIMEOUT_MS;
+
+    while (LL_I2C_IsActiveFlag_BUSY(I2Cx)) {
+        if (LL_SYSTICK_IsActiveCounterFlag()) {
+            if (Timeout-- == 0) {
+                return false;
+            }
+        }
+    }
+
+    if (!I2Cx_StartTransmission(I2Cx, I2C_TRANSMITTER, (SlaveAddr << 1), 1, 0)) {
+        return false;
+    }
+
+    if (!I2Cx_SendByte(I2Cx, 0)) {
+        I2Cx_StopTransmission(I2Cx);
+        return false;
+    }
+
+    I2Cx_StopTransmission(I2Cx);
+
+    return true;
+}
 
 bool I2Cx_ReadData(I2C_TypeDef* I2Cx, uint8_t SlaveAddr, uint16_t ReadAddr,
-    uint8_t AddrLen, uint8_t *pBuffer, uint8_t NumBytesToRead)
+    uint8_t AddrLen, uint8_t *pBuffer, uint16_t NumBytesToRead)
 {
+    bool Result = true;
+    uint32_t Timeout = I2C_BYTE_TIMEOUT_MS;
+    uint8_t recv_size = 0;
+
     if (!pBuffer || !NumBytesToRead) {
         return false;
+    }
+
+    while (LL_I2C_IsActiveFlag_BUSY(I2Cx)) {
+        if (LL_SYSTICK_IsActiveCounterFlag()) {
+            if (Timeout-- == 0) {
+                return false;
+            }
+        }
     }
 
     SlaveAddr = SlaveAddr << 1;
 
     if (AddrLen) {
-        if (!I2Cx_StartTransmission(I2Cx, I2C_TRANSMITTER, SlaveAddr, AddrLen)) {
+        if (!I2Cx_StartTransmission(I2Cx, I2C_TRANSMITTER, SlaveAddr, AddrLen, 0)) {
             return false;
         }
         if (AddrLen == 2 && !I2Cx_SendByte(I2Cx, ReadAddr >> 8)) {
@@ -206,55 +252,117 @@ bool I2Cx_ReadData(I2C_TypeDef* I2Cx, uint8_t SlaveAddr, uint16_t ReadAddr,
         }
     }
 
-    if (!I2Cx_StartTransmission(I2Cx, AddrLen ? I2C_RECEIVER_RESTART : I2C_RECEIVER, SlaveAddr, NumBytesToRead)) {
+    if (NumBytesToRead > MAX_NBYTE_SIZE) {
+        recv_size = MAX_NBYTE_SIZE;
+        Result = I2Cx_StartTransmission(I2Cx, AddrLen ? I2C_RECEIVER_RESTART : I2C_RECEIVER, SlaveAddr, recv_size, 1);
+    } else {
+        recv_size = NumBytesToRead;
+        Result = I2Cx_StartTransmission(I2Cx, AddrLen ? I2C_RECEIVER_RESTART : I2C_RECEIVER, SlaveAddr, recv_size, 0);
+    }
+
+    if (!Result) {
         return false;
     }
 
-    while (NumBytesToRead--) {
+    while (NumBytesToRead) {
         if (!I2Cx_ReceiveByte(I2Cx, pBuffer++)) {
-            I2Cx_StopTransmission(I2Cx);
-            return false;
+            Result = I2C_ERR;
+            break;
         }
-        if (NumBytesToRead == 0) {
-            /* Send STOP after the last byte */
-            I2Cx_StopTransmission(I2Cx);
+        NumBytesToRead--;
+        recv_size--;
+        if ((recv_size == 0) && (NumBytesToRead > 0)) {
+            if (NumBytesToRead > MAX_NBYTE_SIZE) {
+                recv_size = MAX_NBYTE_SIZE;
+                Result = I2Cx_StartTransmission(I2Cx, I2C_RESUME, SlaveAddr, recv_size, 1);
+            } else {
+                recv_size = NumBytesToRead;
+                Result = I2Cx_StartTransmission(I2Cx, I2C_RESUME, SlaveAddr, recv_size, 0);
+            }
+        }
+
+        if (!Result) {
+            break;
         }
     }
 
-    return true;
+    /* Send STOP after the last byte */
+    I2Cx_StopTransmission(I2Cx);
+
+    return Result;
 }
 
 
 bool I2Cx_WriteData(I2C_TypeDef* I2Cx, uint8_t SlaveAddr, uint16_t WriteAddr,
-    uint8_t AddrLen, uint8_t *pBuffer, uint8_t NumBytesToWrite)
+    uint8_t AddrLen, const uint8_t *pBuffer, uint16_t NumBytesToWrite)
 {
     bool Result = true;
+    uint32_t Timeout = I2C_BYTE_TIMEOUT_MS;
+    uint8_t recv_size = 0;
 
     if (!pBuffer || !NumBytesToWrite) {
         return false;
     }
 
+    while (LL_I2C_IsActiveFlag_BUSY(I2Cx)) {
+        if (LL_SYSTICK_IsActiveCounterFlag()) {
+            if (Timeout-- == 0) {
+                return false;
+            }
+        }
+    }
+
     SlaveAddr = SlaveAddr << 1;
 
-    if (!I2Cx_StartTransmission(I2Cx, I2C_TRANSMITTER, SlaveAddr, AddrLen + NumBytesToWrite)) {
+    if ((AddrLen + NumBytesToWrite) > MAX_NBYTE_SIZE) {
+        send_size = MAX_NBYTE_SIZE;
+        Result = I2Cx_StartTransmission(I2Cx, I2C_TRANSMITTER, SlaveAddr, send_size, 1);
+    } else {
+        send_size = AddrLen + NumBytesToWrite;
+        Result = I2Cx_StartTransmission(I2Cx, I2C_TRANSMITTER, SlaveAddr, send_size, 0);
+    }
+
+    if (!Result) {
         return false;
     }
 
-    if (AddrLen == 2 && !I2Cx_SendByte(I2Cx, WriteAddr >> 8)) {
-        I2Cx_StopTransmission(I2Cx);
-        return false;
+    if (AddrLen == 2) {
+        if (!I2Cx_SendByte(I2Cx, WriteAddr >> 8)) {
+            I2Cx_StopTransmission(I2Cx);
+            return false;
+        }
+        send_size--;
     }
-    if (AddrLen >= 1 && !I2Cx_SendByte(I2Cx, WriteAddr & 0xFF)) {
-        I2Cx_StopTransmission(I2Cx);
-        return false;
+    if (AddrLen >= 1) {
+        if (!I2Cx_SendByte(I2Cx, WriteAddr & 0xFF)) {
+            I2Cx_StopTransmission(I2Cx);
+            return false;
+        }
+        send_size--;
     }
 
-    while (NumBytesToWrite--) {
+    while (NumBytesToWrite) {
         if (!I2Cx_SendByte(I2Cx, *pBuffer++)) {
             Result = false;
             break;
         }
+        NumBytesToWrite--;
+        send_size--;
+        if ((send_size == 0) && (NumBytesToWrite > 0)) {
+            if (NumBytesToWrite > MAX_NBYTE_SIZE) {
+                send_size = MAX_NBYTE_SIZE;
+                Result = I2Cx_StartTransmission(I2Cx, I2C_RESUME, SlaveAddr, send_size, 1);
+            } else {
+                send_size = NumBytesToWrite;
+                Result = I2Cx_StartTransmission(I2Cx, I2C_RESUME, SlaveAddr, send_size, 0);
+            }
+        }
+
+        if (!Result) {
+            break;
+        }
     }
+    
     I2Cx_StopTransmission(I2Cx);
 
     return Result;
